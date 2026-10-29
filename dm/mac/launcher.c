@@ -171,6 +171,27 @@ static void saved_choices(void) {   // after the env files, before the bundle's 
     }
 }
 
+// The NX2Apple Controls page saves its global layout in its own preferences domain.
+// A game opened from Finder has no environment from NX2Apple, so read the mirrored
+// strings here; explicit launch and env.txt values still take precedence.
+static void saved_control_layout(void) {
+    CFStringRef domain = CFSTR("org.nxnative.NSPortBuilder");
+    const char *names[] = {"DM_KEYMAP", "DM_PAD_MAP"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (getenv(names[i])) continue;
+        CFStringRef key = CFStringCreateWithFormat(NULL, NULL, CFSTR("controlLayout.%s"), names[i]);
+        CFPropertyListRef value = CFPreferencesCopyAppValue(key, domain);
+        CFRelease(key);
+        if (!value) continue;
+        char text[4096];
+        if (CFGetTypeID(value) == CFStringGetTypeID() && CFStringGetCString(value, text, sizeof text, kCFStringEncodingUTF8) && *text) {
+            setenv(names[i], text, 0);
+            fprintf(stderr, "launcher: env %s=%s (NX2Apple saved controls)\n", names[i], text);
+        }
+        CFRelease(value);
+    }
+}
+
 int main(int argc, char **argv) {
     char self[PATH_MAX], exe[PATH_MAX]; uint32_t n = sizeof self;
     if (_NSGetExecutablePath(self, &n) || !realpath(self, exe)) return 1;
@@ -258,6 +279,7 @@ int main(int argc, char **argv) {
     for (CFIndex i = 0; rules && i < CFArrayGetCount(rules); i++) { char env[128]; if (rule_env(CFArrayGetValueAtIndex(rules, i), env, sizeof env) && getenv(env)) add_key(&g_launch_keys, env); }
     snprintf(p, sizeof p, "%s/env.txt", sup); env_file(p);
     snprintf(p, sizeof p, "%s/env.txt", dm); env_file(p);
+    saved_control_layout();
     setenv("DM_ENV_FILE_KEYS", g_file_keys ? g_file_keys : "", 1); setenv("DM_ENV_LAUNCH_KEYS", g_launch_keys ? g_launch_keys : "", 1);
     free(g_file_keys); free(g_launch_keys);
     int window = !(getenv("DM_LAUNCHER") && !strcmp(getenv("DM_LAUNCHER"), "0"));

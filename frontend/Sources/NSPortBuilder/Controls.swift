@@ -46,6 +46,7 @@ final class ControlLayout: ObservableObject {
             pad = saved.pad.filter { b, to in Self.buttons.contains(b) && (to == "none" || Self.buttons.contains(to)) }
             padMode = saved.mode.flatMap(PadMode.init(rawValue:)) ?? (pad.isEmpty ? .standard : .custom)
         }
+        persistLaunchMappings()
     }
 
     var isDefault: Bool { keys.isEmpty && padChanges == 0 }
@@ -103,6 +104,20 @@ final class ControlLayout: ObservableObject {
 
     private func save() {
         if let data = try? JSONEncoder().encode(Saved(keys: keys.mapValues { $0 ?? -1 }, pad: pad, mode: padMode.rawValue)) { defaults.set(data, forKey: "controlLayout") }
+        persistLaunchMappings()
+    }
+
+    /// Mirror the saved layout into simple preference strings the standalone Mac game launcher can read.
+    private func persistLaunchMappings() {
+        let env = environment
+        for name in ["DM_KEYMAP", "DM_PAD_MAP"] {
+            let key = "controlLayout." + name
+            if let value = env[name] {
+                defaults.set(value, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
     }
 
     /// A key's name on a US keyboard, by virtual key code (the host reads codes, so the name is only for the label).
