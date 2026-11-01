@@ -1404,14 +1404,16 @@ final class BuildModel: ObservableObject {
                         // already carries one, and a second multi-GB file was pure duplication.
                         let made = !self.macAppPath.isEmpty &&
                                    FileManager.default.fileExists(atPath: self.macAppPath)
-                        self.done = made
-                        self.doneNote = self.t(made ? "msg.macAppDone" : "msg.macAppMissing")
                         if made {
                             try? Data().write(to: URL(fileURLWithPath:
                                 (self.macAppPath as NSString).deletingLastPathComponent +
                                 "/.nx2apple-library"))
+                            if !self.patchPath.isEmpty {
+                                self.applyPatchToMacApp(self.macAppPath)
+                                return
+                            }
                         }
-                        self.running = false
+                        self.finishBuild(ok: made, note: self.t(made ? "msg.macAppDone" : "msg.macAppMissing"))
                         self.cleanupStaging()
                     } else if self.installsDirectly {
                         // The same archive as for sideloading, then the app without the game files, then the archive into its Documents
@@ -1451,6 +1453,82 @@ final class BuildModel: ObservableObject {
         running = false
         done = ok
         doneNote = note
+    }
+
+    /// Resolve the common Atmosphere and standalone RomFS patch layouts used by both build targets.
+    nonisolated static func romfsOverlayPath(patchPath: String, basePath: String) -> URL? {
+        let root = URL(fileURLWithPath: patchPath)
+        guard let titleID = titleID(basePath).map({ String(format: "%016llX", $0) }) else { return nil }
+        let candidates = [root.appendingPathComponent("romfs"),
+                          root.appendingPathComponent("\(titleID)/romfs"),
+                          root.appendingPathComponent("atmosphere/contents/\(titleID)/romfs"),
+                          root.appendingPathComponent("contents/\(titleID)/romfs")]
+        if let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) { return found }
+        return root.lastPathComponent.lowercased() == "romfs" && FileManager.default.fileExists(atPath: root.path) ? root : nil
+    }
+
+    /// Merge the selected RomFS overlay into the Mac app's embedded image, then refresh its ad-hoc signature.
+    /// This runs off the main queue because the image can be several gigabytes.
+    private func applyPatchToMacApp(_ appPath: String) {
+        let overlay = Self.romfsOverlayPath(patchPath: patchPath, basePath: basePath)
+        guard let overlay else {
+            finishBuild(ok: false, note: t("data.patchInvalid")); cleanupStaging(); return
+        }
+        let image = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Resources/romfs.img")
+        guard FileManager.default.fileExists(atPath: image.path),
+              FileManager.default.fileExists(atPath: repoPath + "/" + Self.romfsImageTool),
+              FileManager.default.isExecutableFile(atPath: "/usr/bin/codesign") else {
+            finishBuild(ok: false, note: "Mac app RomFS image or required build tool is missing")
+            cleanupStaging(); return
+        }
+        let python = pythonPath.isEmpty ? Self.findPython().path : pythonPath
+        let tool = repoPath + "/" + Self.romfsImageTool
+        let codesign = "/usr/bin/codesign"
+        let output = image.deletingLastPathComponent().appendingPathComponent("romfs.patched-\(UUID().uuidString).img")
+        let backup = image.deletingLastPathComponent().appendingPathComponent("romfs.original-\(UUID().uuidString).img")
+        let stageID = 1001
+        stages.append(Stage(id: stageID, name: t("prog.archive"), state: .running, detail: "Applying translation patch to Mac app"))
+        say("Applying RomFS overlay to \(image.path)")
+        running = true
+        let environment = ["PATH": Self.toolPath(python: python), "HOME": NSHomeDirectory()]
+            .merging(BundledTools.environment(for: python)) { $1 }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let packed = Self.runQuiet([python, tool, "--overlay", "--reuse", image.path, overlay.path, output.path], env: environment)
+            var ok = packed.ok
+            var failureMessage = packed.ok ? "" : packed.out
+            let fm = FileManager.default
+            var movedOriginal = false
+            if ok {
+                do {
+                    try fm.moveItem(at: image, to: backup); movedOriginal = true
+                    try fm.moveItem(at: output, to: image)
+                    let host = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/MacOS/dmhost").path
+                    let hostSign = Self.runQuiet([codesign, "--force", "--sign", "-", host], env: environment)
+                    let appSign = hostSign.ok ? Self.runQuiet([codesign, "--force", "--sign", "-", appPath], env: environment) : hostSign
+                    let verify = appSign.ok ? Self.runQuiet([codesign, "--verify", "--deep", "--strict", appPath], env: environment) : appSign
+                    if !verify.ok { throw NSError(domain: "NX2Apple.RomFSOverlay", code: 1,
+                                                  userInfo: [NSLocalizedDescriptionKey: verify.out.isEmpty ? "Code signing failed" : verify.out]) }
+                    try? fm.removeItem(at: backup)
+                } catch let caught {
+                    ok = false; failureMessage = caught.localizedDescription
+                    try? fm.removeItem(at: image)
+                    if movedOriginal { try? fm.moveItem(at: backup, to: image) }
+                    let host = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/MacOS/dmhost").path
+                    _ = Self.runQuiet([codesign, "--force", "--sign", "-", host], env: environment)
+                    _ = Self.runQuiet([codesign, "--force", "--sign", "-", appPath], env: environment)
+                }
+            }
+            try? fm.removeItem(at: output)
+            DispatchQueue.main.async {
+                if let i = self.stages.firstIndex(where: { $0.id == stageID }) {
+                    self.stages[i].state = ok ? .done : .failed
+                    self.stages[i].detail = ok ? self.t("data.patchApplied") : failureMessage
+                }
+                self.say(ok ? self.t("data.patchApplied") : "RomFS overlay failed: \(failureMessage)")
+                self.finishBuild(ok: ok, note: ok ? self.t("msg.macAppDone") + " — " + self.t("data.patchApplied") : failureMessage)
+                self.cleanupStaging()
+            }
+        }
     }
 
     /// A failed build's log read for the script's known early stops: the card under the build button then says what
@@ -1857,12 +1935,7 @@ final class BuildModel: ObservableObject {
         var overlayPath: String?
         var mergedLooseOverlay = false
         if !patchPath.isEmpty {
-            let titleID = Self.titleID(basePath).map { String(format: "%016llX", $0) } ?? ""
-            let root = URL(fileURLWithPath: patchPath)
-            let candidates = [root.appendingPathComponent("romfs"), root.appendingPathComponent("\(titleID)/romfs"), root.appendingPathComponent("atmosphere/contents/\(titleID)/romfs"), root.appendingPathComponent("contents/\(titleID)/romfs")]
-            var overlay = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) })
-            if overlay == nil, root.lastPathComponent.lowercased() == "romfs" { overlay = root }
-            guard let overlay, !titleID.isEmpty else {
+            guard let overlay = Self.romfsOverlayPath(patchPath: patchPath, basePath: basePath) else {
                 doneNote = t("data.patchInvalid"); running = false; cleanupStaging(); return
             }
             overlayPath = overlay.path
