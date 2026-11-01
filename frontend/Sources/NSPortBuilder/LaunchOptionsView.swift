@@ -268,6 +268,8 @@ struct LaunchOptionsView: View {
                 if list.isEmpty { divider }
                 HStack(spacing: 10) {
                     Spacer()
+                    Button(m.t("launch.modsImport")) { importMod(for: game) }
+                        .padTarget("mods.import", scope: "launch") { importMod(for: game) }
                     Button(m.t("launch.modsRefresh")) { modsRevision += 1 }
                         .padTarget("mods.refresh", scope: "launch") { modsRevision += 1 }
                     Button(m.t("launch.modsOpen")) { openModsFolder() }
@@ -280,6 +282,54 @@ struct LaunchOptionsView: View {
             }
             Text(m.t(list.count > 1 ? "launch.modsNoteOrder" : "launch.modsNote")).font(.manrope(12)).foregroundStyle(.secondary)
                 .padding(.leading, 2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Import an extracted LayeredFS/Atmosphere mod into this game's managed mods folder.
+    /// Accept the mod root, the title-ID folder, or the romfs folder itself.
+    private func importMod(for game: LibraryGame) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = m.t("launch.modsImportHelp")
+        guard panel.runModal() == .OK, let picked = panel.url else { return }
+        let fm = FileManager.default
+        let titleID = game.titleID.uppercased()
+        let candidates = [
+            picked.appendingPathComponent("romfs"),
+            picked.appendingPathComponent("\(titleID)/romfs"),
+            picked.appendingPathComponent("atmosphere/contents/\(titleID)/romfs"),
+            picked.appendingPathComponent("contents/\(titleID)/romfs"),
+        ]
+        var source = candidates.first { fm.fileExists(atPath: $0.path) }
+        if source == nil, picked.lastPathComponent.lowercased() == "romfs" { source = picked }
+        if source == nil, picked.lastPathComponent.uppercased() == titleID {
+            let nested = picked.appendingPathComponent("romfs")
+            if fm.fileExists(atPath: nested.path) { source = nested }
+        }
+        guard let source else {
+            let alert = NSAlert()
+            alert.messageText = m.t("launch.modsImportInvalid")
+            alert.informativeText = picked.path
+            alert.runModal()
+            return
+        }
+        let root = modsFolder ?? GameMod.folder(for: game, library: library.folder)
+        let name = picked.lastPathComponent == "romfs" ? picked.deletingLastPathComponent().lastPathComponent : picked.lastPathComponent
+        let destination = root.appendingPathComponent(name.isEmpty ? "Imported Mod" : name)
+        do {
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+            try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+            try fm.copyItem(at: source, to: destination.appendingPathComponent("romfs"))
+            modsRevision += 1
+            if let imported = GameMod.list(in: root, titleID: game.titleID).first(where: { $0.name == destination.lastPathComponent }) {
+                library.setMod(imported.name, on: true, for: gameID)
+            }
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.runModal()
         }
     }
 

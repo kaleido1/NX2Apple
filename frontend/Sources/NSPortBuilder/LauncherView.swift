@@ -78,7 +78,8 @@ struct ContentView: View {
             } else {
                 BuilderView(m: m, library: library, settings: page == .settings, onViewGame: { page = .library },
                             onOpenSettings: { page = .settings }, onChooseLibraryFolder: chooseLibraryFolder,
-                            onOpenControls: { controlsOpen = true }, onRunSetup: onRunSetup, controlChanges: controls.changeCount)
+                            onOpenControls: { controlsOpen = true }, onRunSetup: onRunSetup,
+                            controlChanges: controls.changeCount, buildEnvironment: controls.environment)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             if m.running || page == .library { activityBar }
@@ -709,8 +710,7 @@ struct ContentView: View {
             launching = true
             let configuration = NSWorkspace.OpenConfiguration()
             // The launch options; the app's launcher (dm/mac/launcher.c) keeps a variable that is already set.
-            // The keyboard and controller layout (Settings → Controls) goes to every game; a build whose host does not read it plays with the default keys.
-            // They stay launch overrides (the environment) for now: DM_KEYMAP and DM_PAD_MAP become saved choices only when seedds/nxnative#386 merges.
+            // The keyboard and controller layout (Settings → Controls) goes to every game. DM_PAD_MAP is also baked into builds.
             library.migrateLaunchOptions()
             let settings = LaunchSetting.forMac(app: game.appPath, titleID: game.titleID, repo: m.repoPath, labels: m.t) ?? []
             let mods = GameMod.list(in: GameMod.folder(for: game, library: library.folder), titleID: game.titleID)

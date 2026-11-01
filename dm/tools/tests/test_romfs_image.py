@@ -74,6 +74,31 @@ class Images(unittest.TestCase):
         image.pack(self.src, self.dst, reuse=True)
         self.assertEqual(set(image.read_index(self.dst)), {'renamed'})
 
+    def test_overlay_image_replaces_adds_and_preserves_files(self):
+        (self.src / 'data').mkdir()
+        (self.src / 'data/replace').write_bytes(b'base')
+        (self.src / 'data/keep').write_bytes(b'keep')
+        (self.src / 'root').write_bytes(b'root')
+        base = self.root / 'base.img'
+        image.pack(self.src, base)
+        overlay = self.root / 'overlay'; (overlay / 'data/newdir').mkdir(parents=True)
+        (overlay / 'data/replace').write_bytes(b'patched')
+        (overlay / 'data/newdir/new').write_bytes(b'new')
+
+        image.overlay_image(base, overlay, self.dst, reuse=True)
+        self.assertTrue(self.valid())
+        self.assertEqual(self.content('data/replace'), b'patched')
+        self.assertEqual(self.content('data/newdir/new'), b'new')
+        self.assertEqual(self.content('data/keep'), b'keep')
+        self.assertEqual(self.content('root'), b'root')
+
+        identity = image.file_identity(self.dst)
+        image.overlay_image(base, overlay, self.dst, reuse=True)
+        self.assertEqual(image.file_identity(self.dst), identity)
+        (overlay / 'data/replace').write_bytes(b'changed')
+        image.overlay_image(base, overlay, self.dst, reuse=True)
+        self.assertEqual(self.content('data/replace'), b'changed')
+
     def test_changed_image_and_forced_repack_are_not_reused(self):
         image.pack(self.src, self.dst, reuse=True)
         self.dst.write_bytes(image.HEAD.pack(image.MAGIC, 32, 0, 0))

@@ -12,6 +12,7 @@
 # The index comes last, so a copy cut off partway has no valid index (the header points past the end of the file) and the host refuses it.
 # Names are the guest names: a host name chosen on a case collision (.dm-case-N) is replaced by the one in its xattr, as hle_fs.c's guest_name does.
 # Usage: romfs_image.py [--reuse] <RomFS folder> <out image>   (written to <out>.part, renamed at the end)
+#        romfs_image.py --overlay [--reuse] <base image> <overlay folder> <out image>
 # --reuse checks the source tree's names and file metadata, the packer's version and the image's identity before keeping a previous image.
 import argparse, hashlib, json, os, struct, subprocess
 from pathlib import Path
@@ -102,6 +103,112 @@ def pack(src, dst, reuse=False):
     return len(ents)
 
 
+def image_entries(img):
+    """Return the image as {guest path: (is_dir, offset, size)} after validating its index."""
+    return read_index(img)
+
+
+def overlay_image(base, overlay, dst, reuse=False):
+    """Build dst from base while replacing/adding files found under overlay.
+
+    Unchanged files are streamed directly from the existing image.  The base image may therefore
+    be many gigabytes without ever being expanded into hundreds of thousands of loose files.
+    """
+    base, overlay, dst = map(os.fspath, (base, overlay, dst))
+    overlay_ents = entries(overlay)
+    digest = {
+        'tool': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'base': file_identity(base),
+        'overlay': source_digest(overlay, overlay_ents),
+    }
+    stamp = dst + '.overlay.inputs.json'
+    if reuse:
+        try:
+            cached = json.loads(Path(stamp).read_text())
+            if cached == {'source': digest, 'image': file_identity(dst)}: return len(image_entries(dst))
+        except (OSError, ValueError, AssertionError, struct.error): pass
+
+    # path -> None for a directory, ('image', offset, size) or ('file', path) for a file.
+    nodes = {'': None}
+    for path, (isdir, off, size) in image_entries(base).items():
+        nodes[path] = None if isdir else ('image', off, size)
+
+    def remove_at(path):
+        prefix = path + '/'
+        for old in [p for p in nodes if p == path or p.startswith(prefix)]: nodes.pop(old, None)
+
+    def add_overlay(path, host, isdir):
+        if path:
+            parent = path.rpartition('/')[0]
+            if nodes.get(parent, None) is not None: remove_at(parent)
+            nodes[parent] = None
+        if isdir:
+            if path in nodes and nodes[path] is not None: remove_at(path)
+            nodes[path] = None
+            for name, child, child_dir in children(host):
+                child_path = (path + '/' if path else '') + os.fsdecode(name)
+                add_overlay(child_path, child, child_dir)
+        else:
+            remove_at(path)
+            nodes[path] = ('file', host)
+
+    for name, host, isdir in children(overlay): add_overlay(os.fsdecode(name), host, isdir)
+
+    children_by_dir = {p: [] for p, source in nodes.items() if source is None}
+    for path in nodes:
+        if not path: continue
+        parent, _, name = path.rpartition('/')
+        children_by_dir.setdefault(parent, []).append((os.fsencode(name), path))
+    for kids in children_by_dir.values(): kids.sort(key=lambda x: x[0])
+
+    # Breadth-first numbering keeps every directory's children in one consecutive run, as the host expects.
+    built = [[b'', '', None, 0, 0]]   # name, path, source, a/offset, b/size
+    i = 0
+    while i < len(built):
+        _, path, source, _, _ = built[i]
+        if source is None:
+            kids = children_by_dir.get(path, [])
+            built[i][3], built[i][4] = len(built), len(kids)
+            built.extend([name, child, nodes[child], 0, 0] for name, child in kids)
+        i += 1
+
+    part = dst + '.part'
+    with open(base, 'rb') as old, open(part, 'wb') as out:
+        out.write(b'\0' * HEAD.size); off = HEAD.size
+        for e in built:
+            source = e[2]
+            if source is None: continue
+            kind, where, *length = source
+            if kind == 'image':
+                old.seek(where); left = length[0]
+                while left:
+                    chunk = old.read(min(left, 8 << 20))
+                    if not chunk: raise ValueError(f'incomplete base RomFS image: {base}')
+                    out.write(chunk); left -= len(chunk)
+                size = length[0]
+            else:
+                size = 0
+                with open(where, 'rb') as src:
+                    while True:
+                        chunk = src.read(8 << 20)
+                        if not chunk: break
+                        out.write(chunk); size += len(chunk)
+            e[3], e[4] = off, size; off += size
+        pool, idx = bytearray(), bytearray()
+        for name, _, source, a, b in built:
+            idx += ENT.pack(a, b, len(pool), len(name), 0 if source is None else 1, 0); pool += name
+        out.write(idx); out.write(pool)
+        out.seek(0); out.write(HEAD.pack(MAGIC, off, len(idx) + len(pool), len(built)))
+
+    if source_digest(overlay, entries(overlay)) != digest['overlay']:
+        os.unlink(part)
+        raise RuntimeError('RomFS overlay changed while packing; run the packer again when its files are stable')
+    os.replace(part, dst)
+    Path(stamp + '.part').write_text(json.dumps({'source': digest, 'image': file_identity(dst)}))
+    os.replace(stamp + '.part', stamp)
+    return len(built)
+
+
 def read_index(img):   # for tests and checks: {guest path: (is dir, offset, size)}
     with open(img, 'rb') as f:
         magic, ioff, isz, n = HEAD.unpack(f.read(HEAD.size))
@@ -175,9 +282,15 @@ if __name__ == '__main__':
         try: print(identity(*sys.argv[2:6]))
         except (OSError, ValueError, TypeError) as e: sys.exit(f'[RED] {e}')
         sys.exit(0)
-    ap = argparse.ArgumentParser(description='Pack a RomFS folder into an indexed image')
+    ap = argparse.ArgumentParser(description='Pack or overlay an indexed RomFS image')
+    ap.add_argument('--overlay', action='store_true', help='apply an overlay folder to an existing image')
     ap.add_argument('--reuse', action='store_true', help='keep the image only while its source tree, packer and image are unchanged')
-    ap.add_argument('source'); ap.add_argument('image')
+    ap.add_argument('paths', nargs='+')
     args = ap.parse_args()
-    n = pack(args.source, args.image, reuse=args.reuse)
-    print(f'{args.image}: {n} entries, {os.path.getsize(args.image)} bytes')
+    if args.overlay:
+        if len(args.paths) != 3: ap.error('--overlay requires BASE_IMAGE OVERLAY_FOLDER OUT_IMAGE')
+        n = overlay_image(*args.paths, reuse=args.reuse); image_path = args.paths[2]
+    else:
+        if len(args.paths) != 2: ap.error('requires ROMFS_FOLDER OUT_IMAGE')
+        n = pack(*args.paths, reuse=args.reuse); image_path = args.paths[1]
+    print(f'{image_path}: {n} entries, {os.path.getsize(image_path)} bytes')
