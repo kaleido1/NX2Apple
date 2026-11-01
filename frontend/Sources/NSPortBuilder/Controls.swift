@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 /// The player's keyboard and controller layout for every game, passed at Play as the host's DM_KEYMAP and DM_PAD_MAP
-/// (dm/host/input_map.h). Only what differs from the host's defaults is kept and passed, so a build whose host does not
-/// read the two variables plays as before, and an unchanged layout passes nothing.
+/// (dm/host/input_map.h). The selected controller map is also baked into games built from this app. Only changes from the
+/// host's defaults are passed, so an unchanged layout passes nothing.
 final class ControlLayout: ObservableObject {
     /// A function the keyboard can hold, named as the host names it (DM_KEYS's names).
     struct Function: Identifiable {

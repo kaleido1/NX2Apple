@@ -135,6 +135,7 @@ final class BuildModel: ObservableObject {
         didSet { UserDefaults.standard.set(bcOnCPU, forKey: "bcOnCPU") }
     }
     @Published var archivePath = ""  // the romfs folder the pack wrote
+    @Published var patchPath = ""  // optional LayeredFS/Atmosphere RomFS overlay for this build
     /// Where this build's folder actually is: --work-dir when the checkout has it, else the script's
     /// default under the input folder (issue #5 — an upstream checkout has no --work-dir).
     var effectiveWorkDir = ""
@@ -299,13 +300,15 @@ final class BuildModel: ObservableObject {
     /// them (#87: romfs_image.py exists since v0.4.8, so a build ran 70 minutes and failed at its last step). A new
     /// tool the launcher calls goes into this list and is then checked before every build.
     nonisolated static let buildScript = "scripts/build_ipa_from_nsp.py"
-    nonisolated static let romfsImageTool = "dm/tools/romfs_image.py"
-    nonisolated static let requiredTools = [buildScript, romfsImageTool]
+    nonisolated static let romfsImageTool = "tools/romfs_image.py"
+    nonisolated static let requiredTools = [buildScript]
 
     /// The tools of `requiredTools` that `dir` does not have (empty: the build tools are as new as this app needs).
     nonisolated static func missingTools(in dir: String) -> [String] {
         let root = EngineLayout.root(dir)   // the checkout's engine/, or an engine tree itself (Engine.swift)
-        return requiredTools.filter { !FileManager.default.fileExists(atPath: root + "/" + $0) }
+        var missing = requiredTools.filter { !FileManager.default.fileExists(atPath: root + "/" + $0) }
+        if !FileManager.default.fileExists(atPath: dir + "/" + romfsImageTool) { missing.append(romfsImageTool) }
+        return missing
     }
 
     /// Whether the checkout's build script has this fork's `--work-dir` (issue #5): an upstream
@@ -1183,10 +1186,16 @@ final class BuildModel: ObservableObject {
     /// nothing to fetch or pull — the update buttons hide and the note says to re-download instead).
     var repoIsGit: Bool { FileManager.default.fileExists(atPath: repoPath + "/.git") }
     var canBuild: Bool { repoOK && slot("base").ok && slot("keys").ok && allDepsPresent && !running }
+    func pickPatch() {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.message = t("data.patchHint")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        patchPath = url.path
+    }
 
     // MARK: Build
 
-    func startBuild() {
+    func startBuild(buildEnvironment: [String: String] = [:]) {
         guard !running else { return }
         stopping = false
         running = true; done = false; doneNote = ""; stages = []; logTail = ""; lineBuf = ""; chainNoteShown = false
@@ -1297,17 +1306,31 @@ final class BuildModel: ObservableObject {
         let engine = EngineLayout.root(repoPath)   // the checkout's engine/ (#214)
         var args = [engine + "/" + Self.buildScript, inputDir, "-k", keysPath,
                     "--progress", "json"]
-        // A compatibility switch the player turned on: written to a small env file the pipeline
-        // copies into the app bundle (main.m sets one variable per line at boot). Only for an IPA;
-        // a Mac app runs on this Mac's GPU, which always has BC support.
+        // Build-time controller mappings become defaults in the built app's bundled dm/env.txt.
+        // Keep them in the same file as the optional BC compatibility switch so neither overwrites the other.
+        var bakedEnvironment: [String: String] = [:]
+        if let padMap = buildEnvironment["DM_PAD_MAP"], !padMap.isEmpty {
+            bakedEnvironment["DM_PAD_MAP"] = padMap
+        }
+        // This compatibility switch is only for iOS builds; a Mac app's GPU always has BC support.
         if bcOnCPU && target != "mac-app" {
+            bakedEnvironment["DM_TEX_BC_CPU"] = "1"
+        }
+        if !bakedEnvironment.isEmpty {
             let envPath = NSTemporaryDirectory() + "nspb-env-\(UUID().uuidString.prefix(8)).txt"
             do {
-                try "DM_TEX_BC_CPU=1\n".write(toFile: envPath, atomically: true, encoding: .utf8)
+                let contents = bakedEnvironment.keys.sorted().compactMap { key in
+                    bakedEnvironment[key].map { "\(key)=\($0)\n" }
+                }.joined()
+                try contents.write(toFile: envPath, atomically: true, encoding: .utf8)
                 args += ["--env-file", envPath]
-                say(t("msg.bcOn"))
+                if bakedEnvironment["DM_TEX_BC_CPU"] != nil { say(t("msg.bcOn")) }
+                if let padMap = bakedEnvironment["DM_PAD_MAP"] {
+                    say(String(format: t("controls.buildMapBaked"), padMap))
+                }
             } catch {
-                say(String(format: t("msg.bcEnvFailed"), error.localizedDescription))
+                fail(String(format: t("msg.buildEnvFailed"), error.localizedDescription))
+                return
             }
         }
         if hasWorkDir { args += ["--work-dir", workDir] }
@@ -1831,6 +1854,36 @@ final class BuildModel: ObservableObject {
         }
         let romfs = extract + "/" + v + "/RomFS"
         let romfsImage = extract + "/" + v + "/RomFS.img"
+        var overlayPath: String?
+        var mergedLooseOverlay = false
+        if !patchPath.isEmpty {
+            let titleID = Self.titleID(basePath).map { String(format: "%016llX", $0) } ?? ""
+            let root = URL(fileURLWithPath: patchPath)
+            let candidates = [root.appendingPathComponent("romfs"), root.appendingPathComponent("\(titleID)/romfs"), root.appendingPathComponent("atmosphere/contents/\(titleID)/romfs"), root.appendingPathComponent("contents/\(titleID)/romfs")]
+            var overlay = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) })
+            if overlay == nil, root.lastPathComponent.lowercased() == "romfs" { overlay = root }
+            guard let overlay, !titleID.isEmpty else {
+                doneNote = t("data.patchInvalid"); running = false; cleanupStaging(); return
+            }
+            overlayPath = overlay.path
+            let fm = FileManager.default
+            func merge(_ src: URL, _ dst: URL) throws {
+                try fm.createDirectory(at: dst, withIntermediateDirectories: true)
+                for name in try fm.contentsOfDirectory(atPath: src.path) {
+                    let a = src.appendingPathComponent(name), b = dst.appendingPathComponent(name)
+                    var isDir: ObjCBool = false; fm.fileExists(atPath: a.path, isDirectory: &isDir)
+                    if isDir.boolValue { try merge(a, b) } else { if fm.fileExists(atPath: b.path) { try fm.removeItem(at: b) }; try fm.copyItem(at: a, to: b) }
+                }
+            }
+            if fm.fileExists(atPath: romfs) {
+                do { try merge(overlay, URL(fileURLWithPath: romfs)); say(t("data.patchApplied")) }
+                catch { doneNote = error.localizedDescription; running = false; cleanupStaging(); return }
+                mergedLooseOverlay = true
+                overlayPath = nil   // the loose tree now contains the patch; pack it normally below
+            } else if !fm.fileExists(atPath: romfsImage) {
+                doneNote = t("data.patchNeedsRomfs"); running = false; cleanupStaging(); return
+            }
+        }
         // The output is Documents/games/<title ID>/romfs — the per-game layout the iOS app looks for
         // first. Copying the whole `games` folder onto the phone (or into a folder the Files app
         // exposes on an external drive) then needs no renaming, and several games' folders can sit
@@ -1867,7 +1920,7 @@ final class BuildModel: ObservableObject {
         // main.m takes Documents/games/<id>/romfs.img before romfs/, so a stale archive would sit
         // there confusingly.
         for old in ((try? fm.contentsOfDirectory(atPath: dest)) ?? [])
-        where old == "romfs.img" || old == "romfs.idx" || (old.hasPrefix("romfs.") && old.dropFirst(6).allSatisfy(\.isNumber)) {
+        where old == "romfs.idx" || (old.hasPrefix("romfs.") && old.dropFirst(6).allSatisfy(\.isNumber)) {
             try? fm.removeItem(atPath: dest + "/" + old)
         }
         let idx = 1000
@@ -1877,7 +1930,7 @@ final class BuildModel: ObservableObject {
         // The extraction may already have packed the image (RomFS.img beside the code modules): then
         // this is a copy, not a pack. Packing it again from a folder that no longer exists was the
         // other half of issue #73.
-        if fm.fileExists(atPath: romfsImage) {
+        if fm.fileExists(atPath: romfsImage), overlayPath == nil, !mergedLooseOverlay {
             let to = dest + "/romfs.img"
             // Reuse by the image's own identity: copying a multi-GB file on every build of an
             // unchanged game is the cost this avoids. Size and modification date are enough — the
@@ -1924,10 +1977,13 @@ final class BuildModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: pythonPath.isEmpty ? "/usr/bin/python3" : pythonPath)
         // dest/romfs.img: one file, which main.m's per-game lookup takes before any folder.
-        let engine = EngineLayout.root(repoPath)
-        p.arguments = [engine + "/" + Self.romfsImageTool, "--reuse", romfs, dest + "/romfs.img"]
+        if let overlayPath {
+            p.arguments = [repoPath + "/" + Self.romfsImageTool, "--overlay", "--reuse", romfsImage, overlayPath, dest + "/romfs.img"]
+        } else {
+            p.arguments = [repoPath + "/" + Self.romfsImageTool, "--reuse", romfs, dest + "/romfs.img"]
+        }
         let romfsPy = p.executableURL!.path
-        p.environment = ["PATH": Self.toolPath("/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", python: romfsPy), "PYTHONPATH": engine + "/dm/tools"]
+        p.environment = ["PATH": Self.toolPath("/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", python: romfsPy), "PYTHONPATH": repoPath + "/tools"]
             .merging(BundledTools.environment(for: romfsPy)) { $1 }
         Self.inOwnGroup(p, python: p.executableURL!.path)
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
@@ -1942,7 +1998,8 @@ final class BuildModel: ObservableObject {
             self.stopping = false
             if succeeded {
                 self.archivePath = dest
-                Self.writeStamp(source: romfs, version: v, to: dest + "/.packstamp")
+                if overlayPath == nil { Self.writeStamp(source: romfs, version: v, to: dest + "/.packstamp") }
+                else { self.say(self.t("data.patchApplied")) }
                 self.placeAddOnContent(workDir: workDir, in: dest)
             }
             if let i = self.stages.firstIndex(where: { $0.id == idx }) {
@@ -3064,6 +3121,7 @@ struct BuilderView: View {
     var controlChanges = 0
     var padMerge: Binding<Bool> = .constant(false)   // "All controllers are player 1" (ControlLayout.padMerge)
     @AppStorage(ConsolePrompt.defaultsKey) private var consolePromptOn = true   // ConsoleCoordinator.swift
+    var buildEnvironment: [String: String] = [:]
     @AppStorage(BuildNotice.defaultsKey) private var notifyBuilds = true   // BuildNotifications.swift
     @AppStorage(ReturnAfterPlay.defaultsKey) private var returnAfterPlay = true   // ReturnAfterPlay.swift
     @State private var extrasOpen = false
@@ -3234,6 +3292,16 @@ struct BuilderView: View {
             ForEach(m.slots.filter { !$0.optional }, id: \.id) { s in
                 divider; slotRow(s)
                 if s.id == "keys", let keyCheck { KeyCheckLine(outcome: keyCheck, t: m.t) }
+            }
+            divider
+            row(m.t("data.patch"), detail: m.patchPath.isEmpty ? m.t("data.patchNone") : m.shortPath(m.patchPath), help: m.patchPath) {
+                if !m.patchPath.isEmpty { Button(m.t("data.clear")) { m.patchPath = "" }.buttonStyle(.plain).foregroundStyle(.secondary) }
+                Button(m.t(m.patchPath.isEmpty ? "data.choose" : "data.change")) { m.pickPatch() }
+            }
+            divider
+            row(m.t("controls.padBuild"), detail: buildEnvironment["DM_PAD_MAP"] == nil ? m.t("controls.padBuildDefault") : m.t("controls.padBuildCustom"),
+                help: buildEnvironment["DM_PAD_MAP"] ?? "") {
+                Button(m.t("controls.customize")) { onOpenControls() }
             }
             divider
             disclosure(m.t("build.options"), isOpen: extrasOpen) { extrasOpen.toggle() }
@@ -3446,7 +3514,7 @@ struct BuilderView: View {
             statusText
             Spacer(minLength: 12)
             Button {
-                m.running ? m.stop() : m.startBuild()
+                m.running ? m.stop() : m.startBuild(buildEnvironment: buildEnvironment)
             } label: {
                 Label(m.running ? m.t(m.stopping ? "library.stopping" : "btn.stop") : (m.done ? m.t("btn.rebuild") : m.t("build.startGame")),
                       systemImage: m.running ? "stop.fill" : "hammer.fill")

@@ -133,8 +133,10 @@ struct ContentView: View {
             } else {
                 BuilderView(m: m, library: library, settings: page == .settings, onViewGame: { page = .library },
                             onOpenSettings: { page = .settings }, onChooseLibraryFolder: chooseLibraryFolder,
-                            onOpenControls: { controlsOpen = true }, onOpenControllers: { controllerSheet = true }, onRunSetup: onRunSetup, controlChanges: controls.changeCount,
-                            padMerge: Binding(get: { controls.padMerge }, set: { setPadMerge($0) }))
+                            onOpenControls: { controlsOpen = true }, onOpenControllers: { controllerSheet = true }, onRunSetup: onRunSetup,
+                            controlChanges: controls.changeCount,
+                            padMerge: Binding(get: { controls.padMerge }, set: { setPadMerge($0) }),
+                            buildEnvironment: controls.environment)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             if m.running || page == .library { activityBar }
